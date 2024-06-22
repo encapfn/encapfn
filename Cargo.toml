@@ -1,0 +1,22 @@
+[package]
+name = "encapfn"
+version = "0.1.0"
+authors = [ "Leon Schuermann <leon@is.currently.online>" ]
+edition = "2021"
+
+[features]
+# By default, we assume that we are operating on a platform where we
+# have an implementation of a stack allocator for variable-sized types
+# (enabled via `stack_alloc`)
+
+std = []
+
+# Enable the stack allocator
+stack_alloc = []
+
+# These two features are exclusive. We should perhaps convert this
+# into a generic type parameter.
+mockrt_heap_alloc = ["std"]
+mockrt_vla_alloc = ["stack_alloc"]
+
+[dependencies]
