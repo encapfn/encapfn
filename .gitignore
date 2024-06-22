@@ -1,0 +1,8 @@
+# Rust target directories
+target
+
+# GDB history files
+.gdb_history
+
+# Ignore VIM temp/swapfiles
+*.swp

@@ -1,0 +1,25 @@
+[package]
+name = "encapfn"
+version = "0.1.0"
+authors = [ "Leon Schuermann <leon@is.currently.online>" ]
+edition = "2021"
+
+[features]
+# Enable features only available with full standard library support. This
+# includes:
+# - a heap allocator backend for MockRt (useful for platforms that don't have
+#   stack frame allocator assembly written)
+std = []
+
+# Enable features only available when compiling on a nightly toolchain. This is
+# a flag for features that are "unconditionally better" and which do not
+# influence the overall behavior of the library meaningfully. Configuration
+# options that don't meet these constraints should get their own feature flags.
+#
+# As of now, this includes:
+# - generating #[doc(cfg( attributes to document that some items are only
+#   available when certain features are selected:
+nightly = []
+
+
+[dependencies]
