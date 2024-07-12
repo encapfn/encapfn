@@ -10,7 +10,7 @@ pub mod rt;
 pub mod types;
 mod util;
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub enum EFError {
     InternalError,
