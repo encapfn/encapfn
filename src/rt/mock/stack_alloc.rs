@@ -21,6 +21,12 @@ pub trait StackFrameAlloc: private::StackFrameAllocSeal {
 
 pub struct StackAllocator<I: StackFrameAlloc>(PhantomData<I>);
 
+impl<I: StackFrameAlloc> StackAllocator<I> {
+    pub fn new() -> Self {
+        StackAllocator(PhantomData)
+    }
+}
+
 impl<I: StackFrameAlloc> super::MockRtAllocator for StackAllocator<I> {
     unsafe fn with_alloc<R, F: FnOnce(*mut ()) -> R>(
         &self,
