@@ -25,7 +25,8 @@ pub unsafe trait EncapfnRt {
 
     fn lookup_symbol<const SYMTAB_SIZE: usize, const FIXED_OFFSET_SYMTAB_SIZE: usize>(
         &self,
-        index: usize,
+        compact_symtab_index: usize,
+        fixed_offset_symtab_index: usize,
         symtabstate: &Self::SymbolTableState<SYMTAB_SIZE, FIXED_OFFSET_SYMTAB_SIZE>,
     ) -> Option<*const ()>;
 
