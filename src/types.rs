@@ -299,6 +299,14 @@ impl<T: 'static> EFCopy<T> {
     ) {
         self.update_from_ref(r.as_immut(), access_scope)
     }
+
+    pub unsafe fn assume_valid(self) -> T {
+        self.0.assume_init()
+    }
+
+    pub unsafe fn assume_valid_ref(&self) -> &T {
+        self.0.assume_init_ref()
+    }
 }
 
 impl<T: EFType + 'static> EFCopy<T> {
