@@ -30,6 +30,19 @@ pub unsafe trait EncapfnRt {
         symtabstate: &Self::SymbolTableState<SYMTAB_SIZE, FIXED_OFFSET_SYMTAB_SIZE>,
     ) -> Option<*const ()>;
 
+    fn setup_callback<C, F, R>(
+        &self,
+        callback: &mut C,
+        alloc_scope: &mut AllocScope<'_, Self::AllocTracker<'_>, Self::ID>,
+        fun: F,
+    ) -> Result<R, EFError>
+    where
+        C: FnMut(),
+        F: for<'b> FnOnce(
+            *const extern "C" fn(),
+            &'b mut AllocScope<'_, Self::AllocTracker<'_>, Self::ID>,
+        ) -> R;
+
     // Can be used to set up memory protection before running the invoke asm.
     fn execute<R, F: FnOnce() -> R>(&self, f: F) -> R {
         // Default: nop
