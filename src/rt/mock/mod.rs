@@ -15,12 +15,20 @@ pub mod heap_alloc;
 
 pub mod stack_alloc;
 
+// Use 6 arguments, as that's how many are passed in registers on x86.
+type CallbackTrampolineFn = extern "C" fn(usize, usize, usize, usize, usize, usize);
+
+#[derive(Debug, Clone)]
+pub struct CallbackCtx {
+    pub arg_regs: [usize; 6],
+}
+
 // TODO: this should be a hashmap which takes a runtime ID derived from the EFID
 // as key, to work with multiple mock runtimes in parallel:
 static mut ACTIVE_ALLOC_CHAIN_HEAD_REF: Option<*const MockRtAllocChain<'static>> = None;
 
 #[inline(never)]
-extern "C" fn mock_rt_callback_dispatch<ID: EFID>(callback_id: usize) {
+extern "C" fn mock_rt_callback_dispatch<ID: EFID>(callback_id: usize, callback_ctx: &CallbackCtx) {
     let alloc_chain_head_ref_opt: &Option<*const MockRtAllocChain<'_>> =
         unsafe { &*core::ptr::addr_of!(ACTIVE_ALLOC_CHAIN_HEAD_REF) };
 
@@ -28,12 +36,28 @@ extern "C" fn mock_rt_callback_dispatch<ID: EFID>(callback_id: usize) {
 
     let alloc_chain_head_ref: &MockRtAllocChain<'static> = unsafe { &*alloc_chain_head_ref_ptr };
 
-    unsafe { alloc_chain_head_ref.invoke_callback(callback_id) };
+    let callback_desc = alloc_chain_head_ref
+        .find_callback_descriptor(callback_id)
+        .expect("Callback not found!");
+
+    unsafe { callback_desc.invoke(callback_ctx) };
 }
 
 // TODO: reason about aliasing of the MockRtAllocChain
-extern "C" fn mock_rt_callback_trampoline<const CALLBACK_ID: usize, ID: EFID>() {
-    mock_rt_callback_dispatch::<ID>(CALLBACK_ID)
+extern "C" fn mock_rt_callback_trampoline<const CALLBACK_ID: usize, ID: EFID>(
+    a0: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+) {
+    mock_rt_callback_dispatch::<ID>(
+        CALLBACK_ID,
+        &CallbackCtx {
+            arg_regs: [a0, a1, a2, a3, a4, a5],
+        },
+    )
 }
 
 pub enum MockRtCallbackTrampolinePool<ID: EFID> {
@@ -42,7 +66,7 @@ pub enum MockRtCallbackTrampolinePool<ID: EFID> {
 
 impl<ID: EFID> MockRtCallbackTrampolinePool<ID> {
     // TODO: pre-generate trampolines with a macro
-    const CALLBACKS: [extern "C" fn(); 32] = [
+    const CALLBACKS: [CallbackTrampolineFn; 32] = [
         mock_rt_callback_trampoline::<0, ID>,
         mock_rt_callback_trampoline::<1, ID>,
         mock_rt_callback_trampoline::<2, ID>,
@@ -138,14 +162,14 @@ impl MockRtAllocation {
 
 #[derive(Debug)]
 pub struct MockRtCallbackDescriptor<'a> {
-    wrapper: unsafe extern "C-unwind" fn(*mut c_void),
+    wrapper: unsafe extern "C" fn(*mut c_void, &CallbackCtx),
     context: *mut c_void,
     _lt: PhantomData<&'a mut c_void>,
 }
 
 impl MockRtCallbackDescriptor<'_> {
-    unsafe fn invoke(&self) {
-        (self.wrapper)(self.context)
+    unsafe fn invoke(&self, callback_ctx: &CallbackCtx) {
+        (self.wrapper)(self.context, callback_ctx)
     }
 }
 
@@ -203,8 +227,8 @@ impl<'a> MockRtAllocChain<'a> {
             .unwrap_or(0)
     }
 
-    unsafe fn invoke_callback(&self, id: usize) {
-        let callback_descriptor = self.iter().find_map(|elem| match elem {
+    fn find_callback_descriptor(&self, id: usize) -> Option<&MockRtCallbackDescriptor<'_>> {
+        self.iter().find_map(|elem| match elem {
             MockRtAllocChain::Base => None,
             MockRtAllocChain::Allocation(_, _) => None,
             MockRtAllocChain::Callback(desc_id, desc, _) => {
@@ -214,13 +238,7 @@ impl<'a> MockRtAllocChain<'a> {
                     None
                 }
             }
-        });
-
-        if let Some(cb) = callback_descriptor {
-            cb.invoke();
-        } else {
-            panic!("Callback descriptor with ID {:?} not found!", id);
-        }
+        })
     }
 }
 
@@ -238,6 +256,8 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
     type ID = ID;
     type AllocTracker<'a> = MockRtAllocChain<'a>;
     type ABI = GenericABI;
+    type CallbackTrampolineFn = CallbackTrampolineFn;
+    type CallbackCtx = CallbackCtx;
 
     type SymbolTableState<const SYMTAB_SIZE: usize, const FIXED_OFFSET_SYMTAB_SIZE: usize> = ();
 
@@ -265,9 +285,9 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
         fun: F,
     ) -> Result<R, EFError>
     where
-        C: FnMut(),
+        C: FnMut(&Self::CallbackCtx),
         F: for<'b> FnOnce(
-            *const extern "C" fn(),
+            *const Self::CallbackTrampolineFn,
             &'b mut AllocScope<'_, Self::AllocTracker<'_>, Self::ID>,
         ) -> R,
     {
@@ -275,14 +295,15 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
             closure: &'a mut ClosureTy,
         }
 
-        unsafe extern "C-unwind" fn callback_wrapper<'a, ClosureTy: FnMut() + 'a>(
+        unsafe extern "C" fn callback_wrapper<'a, ClosureTy: FnMut(&CallbackCtx) + 'a>(
             ctx_ptr: *mut c_void,
+            callback_ctx: &CallbackCtx,
         ) {
             let ctx: &mut Context<'a, ClosureTy> =
                 unsafe { &mut *(ctx_ptr as *mut Context<'a, ClosureTy>) };
 
             // For now, we assume that the functoin doesn't unwind:
-            (ctx.closure)()
+            (ctx.closure)(callback_ctx)
         }
 
         // Ensure that the context pointer is compatible in size and
@@ -321,7 +342,7 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
         let callback_trampoline = MockRtCallbackTrampolinePool::<ID>::CALLBACKS[callback_id];
 
         let res = fun(
-            &callback_trampoline as *const extern "C" fn(),
+            callback_trampoline as *const CallbackTrampolineFn,
             &mut inner_alloc_scope,
         );
 
