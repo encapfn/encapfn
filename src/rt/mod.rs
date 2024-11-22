@@ -39,7 +39,11 @@ pub unsafe trait EncapfnRt {
         fun: F,
     ) -> Result<R, EFError>
     where
-        C: FnMut(&Self::CallbackCtx),
+        C: FnMut(
+            &Self::CallbackCtx,
+            &mut AllocScope<'_, Self::AllocTracker<'_>, Self::ID>,
+            &mut AccessScope<Self::ID>,
+        ),
         F: for<'b> FnOnce(
             *const Self::CallbackTrampolineFn,
             &'b mut AllocScope<'_, Self::AllocTracker<'_>, Self::ID>,

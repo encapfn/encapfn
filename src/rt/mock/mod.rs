@@ -40,7 +40,18 @@ extern "C" fn mock_rt_callback_dispatch<ID: EFID>(callback_id: usize, callback_c
         .find_callback_descriptor(callback_id)
         .expect("Callback not found!");
 
-    unsafe { callback_desc.invoke(callback_ctx) };
+    let mut inner_alloc_scope: AllocScope<'_, MockRtAllocChain<'_>, ID> =
+        unsafe { AllocScope::new(MockRtAllocChain::Cons(alloc_chain_head_ref)) };
+
+    unsafe {
+        callback_desc.invoke(
+            callback_ctx,
+            &mut inner_alloc_scope as *mut _ as *mut (),
+            // Safe, as this should only be triggered by foreign code, when the only
+            // existing AccessScope<ID> is already borrowed by the trampoline:
+            &mut AccessScope::<ID>::new() as *mut _ as *mut (),
+        )
+    };
 }
 
 // TODO: reason about aliasing of the MockRtAllocChain
@@ -140,6 +151,89 @@ impl<ID: EFID, A: MockRtAllocator> MockRt<ID, A> {
             unsafe { AccessScope::new() },
         )
     }
+
+    fn setup_callback_int<'a, C, F, R>(
+        &self,
+        callback: &'a mut C,
+        alloc_scope: &mut AllocScope<
+            '_,
+            <Self as EncapfnRt>::AllocTracker<'_>,
+            <Self as EncapfnRt>::ID,
+        >,
+        fun: F,
+    ) -> Result<R, EFError>
+    where
+        C: FnMut(&<Self as EncapfnRt>::CallbackCtx, *mut (), *mut ()),
+        F: for<'b> FnOnce(
+            *const <Self as EncapfnRt>::CallbackTrampolineFn,
+            &'b mut AllocScope<'_, <Self as EncapfnRt>::AllocTracker<'_>, <Self as EncapfnRt>::ID>,
+        ) -> R,
+    {
+        struct Context<'a, ClosureTy> {
+            closure: &'a mut ClosureTy,
+        }
+
+        unsafe extern "C" fn callback_wrapper<
+            'a,
+            ClosureTy: FnMut(&CallbackCtx, *mut (), *mut ()) + 'a,
+        >(
+            ctx_ptr: *mut c_void,
+            callback_ctx: &CallbackCtx,
+            alloc_scope: *mut (),
+            access_scope: *mut (),
+        ) {
+            let ctx: &mut Context<'a, ClosureTy> =
+                unsafe { &mut *(ctx_ptr as *mut Context<'a, ClosureTy>) };
+
+            // For now, we assume that the functoin doesn't unwind:
+            (ctx.closure)(callback_ctx, alloc_scope, access_scope)
+        }
+
+        // Ensure that the context pointer is compatible in size and
+        // layout to a c_void pointer:
+        assert_eq!(
+            core::mem::size_of::<*mut c_void>(),
+            core::mem::size_of::<*mut Context<'a, C>>()
+        );
+        assert_eq!(
+            core::mem::align_of::<*mut c_void>(),
+            core::mem::align_of::<*mut Context<'a, C>>()
+        );
+
+        let mut ctx: Context<'a, C> = Context { closure: callback };
+
+        let callback_id = alloc_scope.tracker().next_callback_id();
+
+        let alloc_chain_head_ref_opt: &mut Option<*const MockRtAllocChain<'_>> =
+            unsafe { &mut *core::ptr::addr_of_mut!(ACTIVE_ALLOC_CHAIN_HEAD_REF) };
+        let outer_alloc_chain_head_ref = alloc_chain_head_ref_opt.clone();
+
+        let mut inner_alloc_scope = unsafe {
+            AllocScope::new(MockRtAllocChain::Callback(
+                callback_id,
+                MockRtCallbackDescriptor {
+                    wrapper: callback_wrapper::<C>,
+                    context: &mut ctx as *mut _ as *mut c_void,
+                    _lt: PhantomData::<&'a mut c_void>,
+                },
+                alloc_scope.tracker(),
+            ))
+        };
+
+        let tracker = inner_alloc_scope.tracker() as *const _;
+        *alloc_chain_head_ref_opt = Some(tracker as *const MockRtAllocChain<'static>);
+        let callback_trampoline = MockRtCallbackTrampolinePool::<ID>::CALLBACKS[callback_id];
+
+        let res = fun(
+            callback_trampoline as *const CallbackTrampolineFn,
+            &mut inner_alloc_scope,
+        );
+
+        // Reset the alloc_chain_head_ref_opt:
+        *alloc_chain_head_ref_opt = outer_alloc_chain_head_ref;
+
+        Ok(res)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -162,14 +256,19 @@ impl MockRtAllocation {
 
 #[derive(Debug)]
 pub struct MockRtCallbackDescriptor<'a> {
-    wrapper: unsafe extern "C" fn(*mut c_void, &CallbackCtx),
+    wrapper: unsafe extern "C" fn(*mut c_void, &CallbackCtx, *mut (), *mut ()),
     context: *mut c_void,
     _lt: PhantomData<&'a mut c_void>,
 }
 
 impl MockRtCallbackDescriptor<'_> {
-    unsafe fn invoke(&self, callback_ctx: &CallbackCtx) {
-        (self.wrapper)(self.context, callback_ctx)
+    unsafe fn invoke(
+        &self,
+        callback_ctx: &CallbackCtx,
+        alloc_scope: *mut (),
+        access_scope: *mut (),
+    ) {
+        (self.wrapper)(self.context, callback_ctx, alloc_scope, access_scope)
     }
 }
 
@@ -182,6 +281,7 @@ pub enum MockRtAllocChain<'a> {
         MockRtCallbackDescriptor<'a>,
         &'a MockRtAllocChain<'a>,
     ),
+    Cons(&'a MockRtAllocChain<'a>),
 }
 
 struct MockRtAllocChainIter<'a>(Option<&'a MockRtAllocChain<'a>>);
@@ -195,6 +295,7 @@ impl<'a> Iterator for MockRtAllocChainIter<'a> {
                 MockRtAllocChain::Base => None,
                 MockRtAllocChain::Allocation(_, pred) => Some(pred),
                 MockRtAllocChain::Callback(_, _, pred) => Some(pred),
+                MockRtAllocChain::Cons(pred) => Some(pred),
             };
 
             Some(cur)
@@ -214,6 +315,7 @@ impl<'a> MockRtAllocChain<'a> {
             MockRtAllocChain::Base => false,
             MockRtAllocChain::Allocation(alloc, _) => alloc.matches(ptr, len, mutable),
             MockRtAllocChain::Callback(_, _, _) => false,
+            MockRtAllocChain::Cons(_) => false,
         })
     }
 
@@ -223,6 +325,7 @@ impl<'a> MockRtAllocChain<'a> {
                 MockRtAllocChain::Base => None,
                 MockRtAllocChain::Allocation(_, _) => None,
                 MockRtAllocChain::Callback(id, _, _) => Some(id + 1),
+                MockRtAllocChain::Cons(_) => None,
             })
             .unwrap_or(0)
     }
@@ -238,6 +341,7 @@ impl<'a> MockRtAllocChain<'a> {
                     None
                 }
             }
+            MockRtAllocChain::Cons(_) => None,
         })
     }
 }
@@ -285,71 +389,34 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
         fun: F,
     ) -> Result<R, EFError>
     where
-        C: FnMut(&Self::CallbackCtx),
+        C: FnMut(
+            &Self::CallbackCtx,
+            &mut AllocScope<'_, Self::AllocTracker<'_>, Self::ID>,
+            &mut AccessScope<Self::ID>,
+        ),
         F: for<'b> FnOnce(
             *const Self::CallbackTrampolineFn,
             &'b mut AllocScope<'_, Self::AllocTracker<'_>, Self::ID>,
         ) -> R,
     {
-        struct Context<'a, ClosureTy> {
-            closure: &'a mut ClosureTy,
-        }
+        let typecast_callback =
+            &mut |callback_ctx: &CallbackCtx,
+                  alloc_scope_ptr: *mut (),
+                  access_scope_ptr: *mut ()| {
+                let alloc_scope = unsafe {
+                    &mut *(alloc_scope_ptr as *mut AllocScope<'_, Self::AllocTracker<'_>, Self::ID>)
+                };
 
-        unsafe extern "C" fn callback_wrapper<'a, ClosureTy: FnMut(&CallbackCtx) + 'a>(
-            ctx_ptr: *mut c_void,
-            callback_ctx: &CallbackCtx,
-        ) {
-            let ctx: &mut Context<'a, ClosureTy> =
-                unsafe { &mut *(ctx_ptr as *mut Context<'a, ClosureTy>) };
+                let access_scope =
+                    unsafe { &mut *(access_scope_ptr as *mut AccessScope<Self::ID>) };
 
-            // For now, we assume that the functoin doesn't unwind:
-            (ctx.closure)(callback_ctx)
-        }
+                callback(callback_ctx, alloc_scope, access_scope);
+            };
 
-        // Ensure that the context pointer is compatible in size and
-        // layout to a c_void pointer:
-        assert_eq!(
-            core::mem::size_of::<*mut c_void>(),
-            core::mem::size_of::<*mut Context<'a, C>>()
-        );
-        assert_eq!(
-            core::mem::align_of::<*mut c_void>(),
-            core::mem::align_of::<*mut Context<'a, C>>()
-        );
-
-        let mut ctx: Context<'a, C> = Context { closure: callback };
-
-        let callback_id = alloc_scope.tracker().next_callback_id();
-
-        let alloc_chain_head_ref_opt: &mut Option<*const MockRtAllocChain<'_>> =
-            unsafe { &mut *core::ptr::addr_of_mut!(ACTIVE_ALLOC_CHAIN_HEAD_REF) };
-        let outer_alloc_chain_head_ref = alloc_chain_head_ref_opt.clone();
-
-        let mut inner_alloc_scope = unsafe {
-            AllocScope::new(MockRtAllocChain::Callback(
-                callback_id,
-                MockRtCallbackDescriptor {
-                    wrapper: callback_wrapper::<C>,
-                    context: &mut ctx as *mut _ as *mut c_void,
-                    _lt: PhantomData::<&'a mut c_void>,
-                },
-                alloc_scope.tracker(),
-            ))
-        };
-
-        let tracker = inner_alloc_scope.tracker() as *const _;
-        *alloc_chain_head_ref_opt = Some(tracker as *const MockRtAllocChain<'static>);
-        let callback_trampoline = MockRtCallbackTrampolinePool::<ID>::CALLBACKS[callback_id];
-
-        let res = fun(
-            callback_trampoline as *const CallbackTrampolineFn,
-            &mut inner_alloc_scope,
-        );
-
-        // Reset the alloc_chain_head_ref_opt:
-        *alloc_chain_head_ref_opt = outer_alloc_chain_head_ref;
-
-        Ok(res)
+        // We need to erase the type-dependence of the closure argument on `ID`,
+        // as that creates life-time issues when the `MockRtAllocChain` is
+        // parameterized over it:
+        self.setup_callback_int(typecast_callback, alloc_scope, fun)
     }
 
     fn allocate_stacked_untracked_mut<F, R>(
