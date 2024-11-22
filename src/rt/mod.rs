@@ -50,8 +50,20 @@ pub unsafe trait EncapfnRt {
         ) -> R;
 
     // Can be used to set up memory protection before running the invoke asm.
-    fn execute<R, F: FnOnce() -> R>(&self, f: F) -> R {
-        // Default: nop
+    fn execute<R, F: FnOnce() -> R>(
+        &self,
+        _alloc_scope: &mut AllocScope<'_, Self::AllocTracker<'_>, Self::ID>,
+        _access_scope: &mut AccessScope<Self::ID>,
+        f: F,
+    ) -> R {
+        // Default: nop.
+        //
+        // If implementations want to support callbacks, this will need to stash
+        // the AllocScope + AccessScope somewhere.
+        //
+        // For the AccessScope, they may alternatively rely on it being
+        // exclusively borrowed for the duration of the call and create a new
+        // instance with a strictly shorter lifetime.
         f()
     }
 
