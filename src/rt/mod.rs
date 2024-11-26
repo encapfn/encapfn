@@ -14,7 +14,8 @@ pub unsafe trait EncapfnRt {
     type AllocTracker<'a>: AllocTracker;
     type ABI: EncapfnABI;
     type CallbackTrampolineFn;
-    type CallbackCtx: core::fmt::Debug + Clone;
+    type CallbackContext: core::fmt::Debug + Clone;
+    type CallbackReturn: core::fmt::Debug + Clone;
 
     type SymbolTableState<const SYMTAB_SIZE: usize, const FIXED_OFFSET_SYMTAB_SIZE: usize>;
 
@@ -40,7 +41,8 @@ pub unsafe trait EncapfnRt {
     ) -> Result<R, EFError>
     where
         C: FnMut(
-            &Self::CallbackCtx,
+            &Self::CallbackContext,
+            &mut Self::CallbackReturn,
             &mut AllocScope<'_, Self::AllocTracker<'_>, Self::ID>,
             &mut AccessScope<Self::ID>,
         ),
