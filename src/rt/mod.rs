@@ -9,13 +9,21 @@ use crate::types::{
 };
 use crate::EFError;
 
+pub trait CallbackContext {
+    fn get_argument_register(&self, reg: usize) -> Option<usize>;
+}
+
+pub trait CallbackReturn {
+    fn set_return_register(&mut self, reg: usize, value: usize) -> bool;
+}
+
 pub unsafe trait EncapfnRt {
     type ID: EFID;
     type AllocTracker<'a>: AllocTracker;
     type ABI: EncapfnABI;
     type CallbackTrampolineFn;
-    type CallbackContext: core::fmt::Debug + Clone;
-    type CallbackReturn: core::fmt::Debug + Clone;
+    type CallbackContext: CallbackContext + core::fmt::Debug + Clone;
+    type CallbackReturn: CallbackReturn + core::fmt::Debug + Clone;
 
     type SymbolTableState<const SYMTAB_SIZE: usize, const FIXED_OFFSET_SYMTAB_SIZE: usize>;
 

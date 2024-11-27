@@ -5,7 +5,7 @@ use core::mem::MaybeUninit;
 
 use crate::abi::GenericABI;
 use crate::branding::EFID;
-use crate::rt::EncapfnRt;
+use crate::rt::{CallbackContext, CallbackReturn, EncapfnRt};
 use crate::types::{AccessScope, AllocScope, AllocTracker, EFMutRef, EFPtr, EFRef, EFSlice};
 use crate::EFError;
 
@@ -26,13 +26,30 @@ type CallbackTrampolineFn =
     extern "C" fn(usize, usize, usize, usize, usize, usize) -> CallbackTrampolineFnReturn;
 
 #[derive(Debug, Clone)]
-pub struct CallbackContext {
+pub struct MockRtCallbackContext {
     pub arg_regs: [usize; 6],
 }
 
+impl CallbackContext for MockRtCallbackContext {
+    fn get_argument_register(&self, reg: usize) -> Option<usize> {
+        self.arg_regs.get(reg).copied()
+    }
+}
+
 #[derive(Debug, Clone)]
-pub struct CallbackReturn {
+pub struct MockRtCallbackReturn {
     pub return_regs: [usize; 2],
+}
+
+impl CallbackReturn for MockRtCallbackReturn {
+    fn set_return_register(&mut self, reg: usize, value: usize) -> bool {
+        if let Some(r) = self.return_regs.get_mut(reg) {
+            *r = value;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 // TODO: this should be a hashmap which takes a runtime ID derived from the EFID
@@ -42,8 +59,8 @@ static mut ACTIVE_ALLOC_CHAIN_HEAD_REF: Option<*const MockRtAllocChain<'static>>
 #[inline(never)]
 extern "C" fn mock_rt_callback_dispatch<ID: EFID>(
     callback_id: usize,
-    callback_ctx: &CallbackContext,
-    callback_ret: &mut CallbackReturn,
+    callback_ctx: &MockRtCallbackContext,
+    callback_ret: &mut MockRtCallbackReturn,
 ) {
     let alloc_chain_head_ref_opt: &Option<*const MockRtAllocChain<'_>> =
         unsafe { &*core::ptr::addr_of!(ACTIVE_ALLOC_CHAIN_HEAD_REF) };
@@ -80,13 +97,13 @@ extern "C" fn mock_rt_callback_trampoline<const CALLBACK_ID: usize, ID: EFID>(
     a4: usize,
     a5: usize,
 ) -> CallbackTrampolineFnReturn {
-    let mut callback_ret = CallbackReturn {
+    let mut callback_ret = MockRtCallbackReturn {
         return_regs: [0; 2],
     };
 
     mock_rt_callback_dispatch::<ID>(
         CALLBACK_ID,
-        &CallbackContext {
+        &MockRtCallbackContext {
             arg_regs: [a0, a1, a2, a3, a4, a5],
         },
         &mut callback_ret,
@@ -207,11 +224,11 @@ impl<ID: EFID, A: MockRtAllocator> MockRt<ID, A> {
 
         unsafe extern "C" fn callback_wrapper<
             'a,
-            ClosureTy: FnMut(&CallbackContext, &mut CallbackReturn, *mut (), *mut ()) + 'a,
+            ClosureTy: FnMut(&MockRtCallbackContext, &mut MockRtCallbackReturn, *mut (), *mut ()) + 'a,
         >(
             ctx_ptr: *mut c_void,
-            callback_ctx: &CallbackContext,
-            callback_ret: &mut CallbackReturn,
+            callback_ctx: &MockRtCallbackContext,
+            callback_ret: &mut MockRtCallbackReturn,
             alloc_scope: *mut (),
             access_scope: *mut (),
         ) {
@@ -289,8 +306,13 @@ impl MockRtAllocation {
 
 #[derive(Debug)]
 pub struct MockRtCallbackDescriptor<'a> {
-    wrapper:
-        unsafe extern "C" fn(*mut c_void, &CallbackContext, &mut CallbackReturn, *mut (), *mut ()),
+    wrapper: unsafe extern "C" fn(
+        *mut c_void,
+        &MockRtCallbackContext,
+        &mut MockRtCallbackReturn,
+        *mut (),
+        *mut (),
+    ),
     context: *mut c_void,
     _lt: PhantomData<&'a mut c_void>,
 }
@@ -298,8 +320,8 @@ pub struct MockRtCallbackDescriptor<'a> {
 impl MockRtCallbackDescriptor<'_> {
     unsafe fn invoke(
         &self,
-        callback_ctx: &CallbackContext,
-        callback_ret: &mut CallbackReturn,
+        callback_ctx: &MockRtCallbackContext,
+        callback_ret: &mut MockRtCallbackReturn,
         alloc_scope: *mut (),
         access_scope: *mut (),
     ) {
@@ -402,8 +424,8 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
     type AllocTracker<'a> = MockRtAllocChain<'a>;
     type ABI = GenericABI;
     type CallbackTrampolineFn = CallbackTrampolineFn;
-    type CallbackContext = CallbackContext;
-    type CallbackReturn = CallbackReturn;
+    type CallbackContext = MockRtCallbackContext;
+    type CallbackReturn = MockRtCallbackReturn;
 
     type SymbolTableState<const SYMTAB_SIZE: usize, const FIXED_OFFSET_SYMTAB_SIZE: usize> = ();
 
@@ -443,8 +465,8 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
         ) -> R,
     {
         let typecast_callback =
-            &mut |callback_ctx: &CallbackContext,
-                  callback_ret: &mut CallbackReturn,
+            &mut |callback_ctx: &MockRtCallbackContext,
+                  callback_ret: &mut MockRtCallbackReturn,
                   alloc_scope_ptr: *mut (),
                   access_scope_ptr: *mut ()| {
                 let alloc_scope = unsafe {
