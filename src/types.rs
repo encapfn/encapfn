@@ -1036,3 +1036,44 @@ mod primitives {
         }
     }
 }
+
+/// Get an `EFMutRef` reference to a member of a struct wrapped in an
+/// `EFMutRef`
+///
+/// TODO: this is a workaround until we derive EFType for nested types
+/// in bindgen and provide safe methods for accessing struct members.
+///
+/// Usage example:
+///
+/// ```
+/// use encapfn::types::EFMutRef;
+/// use encapfn::branding::EFID;
+/// use encapfn::efmutref_get_field;
+///
+/// struct TestStruct {
+///     test_member: u32,
+/// }
+///
+/// fn test_fn<'alloc, ID: EFID>(test_struct: EFMutRef<'alloc, ID, TestStruct>) {
+///     let _test_member_ref: EFMutRef<'alloc, ID, u32> =
+///         unsafe { efmutref_get_field!(TestStruct, u32, test_struct, test_member) };
+/// }
+/// ```
+#[macro_export]
+macro_rules! efmutref_get_field {
+    ($outer_type:ty, $inner_type:ty, $outer_ref:expr, $member:ident) => {{
+        unsafe fn efmutref_get_field_helper<'alloc, ID: $crate::branding::EFID>(
+            outer: $crate::types::EFMutRef<'alloc, ID, $outer_type>,
+        ) -> $crate::types::EFMutRef<'alloc, ID, $inner_type> {
+            let outer_ptr: *mut () = outer.as_ptr().cast::<()>().into();
+            let inner_efptr: $crate::types::EFPtr<$inner_type> =
+                $crate::types::EFPtr::from(unsafe {
+                    outer_ptr.byte_offset(::core::mem::offset_of!($outer_type, $member,) as isize)
+                })
+                .cast::<$inner_type>();
+            unsafe { inner_efptr.upgrade_unchecked_mut() }
+        }
+
+        efmutref_get_field_helper($outer_ref)
+    }};
+}
