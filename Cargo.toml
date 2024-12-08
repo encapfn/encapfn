@@ -21,5 +21,7 @@ std = []
 #   available when certain features are selected:
 nightly = []
 
+disable_upgrade_checks = []
+disable_validation_checks = []
 
 [dependencies]

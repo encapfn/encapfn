@@ -6,6 +6,10 @@ use core::ops::Deref;
 use crate::branding::EFID;
 use crate::util::maybe_uninit_as_bytes;
 
+// Both of these should issue warnings when enabled:
+const DISABLE_UPGRADE_CHECKS: bool = cfg!(feature = "disable_upgrade_checks");
+const DISABLE_VALIDATION_CHECKS: bool = cfg!(feature = "disable_validation_checks");
+
 pub unsafe trait AllocTracker {
     fn is_valid(&self, ptr: *const (), len: usize) -> bool;
     fn is_valid_mut(&self, ptr: *mut (), len: usize) -> bool;
@@ -107,14 +111,18 @@ impl<T: 'static> EFPtr<T> {
         &self,
         alloc_scope: &AllocScope<'alloc, R, ID>,
     ) -> Option<EFRef<'alloc, ID, T>> {
-        if self.0.is_aligned()
-            && alloc_scope
-                .tracker()
-                .is_valid(self.0 as *const (), core::mem::size_of::<T>())
-        {
+        if DISABLE_UPGRADE_CHECKS {
             Some(unsafe { self.upgrade_unchecked() })
         } else {
-            None
+            if self.0.is_aligned()
+                && alloc_scope
+                    .tracker()
+                    .is_valid(self.0 as *const (), core::mem::size_of::<T>())
+            {
+                Some(unsafe { self.upgrade_unchecked() })
+            } else {
+                None
+            }
         }
     }
 
@@ -129,14 +137,18 @@ impl<T: 'static> EFPtr<T> {
         &self,
         alloc_scope: &AllocScope<'alloc, R, ID>,
     ) -> Option<EFMutRef<'alloc, ID, T>> {
-        if self.0.is_aligned()
-            && alloc_scope
-                .tracker()
-                .is_valid_mut(self.0 as *mut (), core::mem::size_of::<T>())
-        {
+        if DISABLE_UPGRADE_CHECKS {
             Some(unsafe { self.upgrade_unchecked_mut() })
         } else {
-            None
+            if self.0.is_aligned()
+                && alloc_scope
+                    .tracker()
+                    .is_valid_mut(self.0 as *mut (), core::mem::size_of::<T>())
+            {
+                Some(unsafe { self.upgrade_unchecked_mut() })
+            } else {
+                None
+            }
         }
     }
 
@@ -161,27 +173,32 @@ impl<T: 'static> EFPtr<T> {
         length: usize,
         alloc_scope: &AllocScope<'alloc, R, ID>,
     ) -> Option<EFSlice<'alloc, ID, T>> {
-        // As per Rust reference, "An array of [T; N] has a size of
-        // size_of::<T>() * N and the same alignment of T", and, "Slices have
-        // the same layout as the section of the array they slice", so checking
-        // for alignment of T is sufficient.
-        //
-        // Furthermore, for `std::mem::size_of`, the function documentation reads:
-        //
-        //     More specifically, this is the offset in bytes between successive
-        //     elements in an array with that item type including alignment
-        //     padding. Thus, for any type T and length n, [T; n] has a size of
-        //     n * size_of::<T>().
-        //
-        // Hence we perform the check for exactly this expression:
-        if self.0.is_aligned()
-            && alloc_scope
-                .tracker()
-                .is_valid(self.0 as *const (), length * core::mem::size_of::<T>())
-        {
+        if DISABLE_UPGRADE_CHECKS {
             Some(unsafe { self.upgrade_unchecked_slice(length) })
         } else {
-            None
+            // As per Rust reference, "An array of [T; N] has a size of
+            // size_of::<T>() * N and the same alignment of T", and, "Slices
+            // have the same layout as the section of the array they slice", so
+            // checking for alignment of T is sufficient.
+            //
+            // Furthermore, for `std::mem::size_of`, the function documentation
+            // reads:
+            //
+            //     More specifically, this is the offset in bytes between
+            //     successive elements in an array with that item type including
+            //     alignment padding. Thus, for any type T and length n, [T; n]
+            //     has a size of n * size_of::<T>().
+            //
+            // Hence we perform the check for exactly this expression:
+            if self.0.is_aligned()
+                && alloc_scope
+                    .tracker()
+                    .is_valid(self.0 as *const (), length * core::mem::size_of::<T>())
+            {
+                Some(unsafe { self.upgrade_unchecked_slice(length) })
+            } else {
+                None
+            }
         }
     }
 
@@ -206,27 +223,31 @@ impl<T: 'static> EFPtr<T> {
         length: usize,
         alloc_scope: &AllocScope<'alloc, R, ID>,
     ) -> Option<EFMutSlice<'alloc, ID, T>> {
-        // As per Rust reference, "An array of [T; N] has a size of
-        // size_of::<T>() * N and the same alignment of T", and, "Slices have
-        // the same layout as the section of the array they slice", so checking
-        // for alignment of T is sufficient.
-        //
-        // Furthermore, for `std::mem::size_of`, the function documentation reads:
-        //
-        //     More specifically, this is the offset in bytes between successive
-        //     elements in an array with that item type including alignment
-        //     padding. Thus, for any type T and length n, [T; n] has a size of
-        //     n * size_of::<T>().
-        //
-        // Hence we perform the check for exactly this expression:
-        if self.0.is_aligned()
-            && alloc_scope
-                .tracker()
-                .is_valid_mut(self.0 as *mut (), length * core::mem::size_of::<T>())
-        {
+        if DISABLE_UPGRADE_CHECKS {
             Some(unsafe { self.upgrade_unchecked_slice_mut(length) })
         } else {
-            None
+            // As per Rust reference, "An array of [T; N] has a size of
+            // size_of::<T>() * N and the same alignment of T", and, "Slices
+            // have the same layout as the section of the array they slice", so
+            // checking for alignment of T is sufficient.
+            //
+            // Furthermore, for `std::mem::size_of`, the function documentation reads:
+            //
+            //     More specifically, this is the offset in bytes between
+            //     successive elements in an array with that item type including
+            //     alignment padding. Thus, for any type T and length n, [T; n]
+            //     has a size of n * size_of::<T>().
+            //
+            // Hence we perform the check for exactly this expression:
+            if self.0.is_aligned()
+                && alloc_scope
+                    .tracker()
+                    .is_valid_mut(self.0 as *mut (), length * core::mem::size_of::<T>())
+            {
+                Some(unsafe { self.upgrade_unchecked_slice_mut(length) })
+            } else {
+                None
+            }
         }
     }
 }
@@ -311,18 +332,26 @@ impl<T: 'static> EFCopy<T> {
 
 impl<T: EFType + 'static> EFCopy<T> {
     pub fn validate(self) -> Result<T, Self> {
-        if unsafe { <T as EFType>::validate(&self.0 as *const MaybeUninit<T> as *const T) } {
-            Ok(unsafe { self.0.assume_init() })
+        if DISABLE_VALIDATION_CHECKS {
+            Ok(unsafe { self.assume_valid() })
         } else {
-            Err(self)
+            if unsafe { <T as EFType>::validate(&self.0 as *const MaybeUninit<T> as *const T) } {
+                Ok(unsafe { self.0.assume_init() })
+            } else {
+                Err(self)
+            }
         }
     }
 
     pub fn validate_ref<'a>(&'a self) -> Option<&'a T> {
-        if unsafe { <T as EFType>::validate(&self.0 as *const MaybeUninit<T> as *const T) } {
-            Some(unsafe { self.0.assume_init_ref() })
+        if DISABLE_VALIDATION_CHECKS {
+            Some(unsafe { self.assume_valid_ref() })
         } else {
-            None
+            if unsafe { <T as EFType>::validate(&self.0 as *const MaybeUninit<T> as *const T) } {
+                Some(unsafe { self.0.assume_init_ref() })
+            } else {
+                None
+            }
         }
     }
 
@@ -356,12 +385,16 @@ impl<'alloc, ID: EFID, T: EFType + 'static> EFMutRef<'alloc, ID, T> {
         &self,
         access_scope: &'access AccessScope<ID>,
     ) -> Option<EFVal<'alloc, 'access, ID, T>> {
-        if unsafe {
-            <T as EFType>::validate(self.0 as *const UnsafeCell<MaybeUninit<T>> as *const T)
-        } {
+        if DISABLE_VALIDATION_CHECKS {
             Some(unsafe { self.assume_valid(access_scope) })
         } else {
-            None
+            if unsafe {
+                <T as EFType>::validate(self.0 as *const UnsafeCell<MaybeUninit<T>> as *const T)
+            } {
+                Some(unsafe { self.assume_valid(access_scope) })
+            } else {
+                None
+            }
         }
     }
 }
@@ -588,16 +621,20 @@ impl<'alloc, ID: EFID, T: EFType + 'static> EFMutSlice<'alloc, ID, T> {
         &self,
         access_scope: &'access AccessScope<ID>,
     ) -> Option<EFSliceVal<'alloc, 'access, ID, T>> {
-        if self
-            .0
-            .iter()
-            .all(|elem: &UnsafeCell<MaybeUninit<T>>| unsafe {
-                <T as EFType>::validate(elem as *const UnsafeCell<MaybeUninit<T>> as *const T)
-            })
-        {
+        if DISABLE_VALIDATION_CHECKS {
             Some(unsafe { self.assume_valid(access_scope) })
         } else {
-            None
+            if self
+                .0
+                .iter()
+                .all(|elem: &UnsafeCell<MaybeUninit<T>>| unsafe {
+                    <T as EFType>::validate(elem as *const UnsafeCell<MaybeUninit<T>> as *const T)
+                })
+            {
+                Some(unsafe { self.assume_valid(access_scope) })
+            } else {
+                None
+            }
         }
     }
 }
@@ -643,12 +680,16 @@ impl<'alloc, ID: EFID, T: EFType + 'static> EFRef<'alloc, ID, T> {
         &self,
         access_scope: &'access AccessScope<ID>,
     ) -> Option<EFVal<'alloc, 'access, ID, T>> {
-        if unsafe {
-            <T as EFType>::validate(self.0 as *const UnsafeCell<MaybeUninit<T>> as *const T)
-        } {
+        if DISABLE_VALIDATION_CHECKS {
             Some(unsafe { self.assume_valid(access_scope) })
         } else {
-            None
+            if unsafe {
+                <T as EFType>::validate(self.0 as *const UnsafeCell<MaybeUninit<T>> as *const T)
+            } {
+                Some(unsafe { self.assume_valid(access_scope) })
+            } else {
+                None
+            }
         }
     }
 }
@@ -791,16 +832,20 @@ impl<'alloc, ID: EFID, T: EFType + 'static> EFSlice<'alloc, ID, T> {
         &self,
         access_scope: &'access AccessScope<ID>,
     ) -> Option<EFSliceVal<'alloc, 'access, ID, T>> {
-        if self
-            .0
-            .iter()
-            .all(|elem: &UnsafeCell<MaybeUninit<T>>| unsafe {
-                <T as EFType>::validate(elem as *const UnsafeCell<MaybeUninit<T>> as *const T)
-            })
-        {
+        if DISABLE_VALIDATION_CHECKS {
             Some(unsafe { self.assume_valid(access_scope) })
         } else {
-            None
+            if self
+                .0
+                .iter()
+                .all(|elem: &UnsafeCell<MaybeUninit<T>>| unsafe {
+                    <T as EFType>::validate(elem as *const UnsafeCell<MaybeUninit<T>> as *const T)
+                })
+            {
+                Some(unsafe { self.assume_valid(access_scope) })
+            } else {
+                None
+            }
         }
     }
 }
@@ -810,11 +855,19 @@ impl<'alloc, ID: EFID> EFSlice<'alloc, ID, u8> {
         &self,
         _access_scope: &'access AccessScope<ID>,
     ) -> Option<EFVal<'alloc, 'access, ID, str>> {
-        // We rely on the fact that u8s are unconditionally valid, and we hold onto an AccessScope
-        // here
-        core::str::from_utf8(unsafe { &*(self.0 as *const _ as *const [u8]) })
-            .ok()
-            .map(|s| EFVal(s, PhantomData, PhantomData))
+        if DISABLE_VALIDATION_CHECKS {
+            Some(EFVal(
+                unsafe { core::str::from_utf8_unchecked(&*(self.0 as *const _ as *const [u8])) },
+                PhantomData,
+                PhantomData,
+            ))
+        } else {
+            // We rely on the fact that u8s are unconditionally valid, and we
+            // hold onto an AccessScope here
+            core::str::from_utf8(unsafe { &*(self.0 as *const _ as *const [u8]) })
+                .ok()
+                .map(|s| EFVal(s, PhantomData, PhantomData))
+        }
     }
 }
 

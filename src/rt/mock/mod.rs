@@ -23,7 +23,7 @@ pub struct CallbackTrampolineFnReturn {
 }
 
 type CallbackTrampolineFn =
-    extern "C" fn(usize, usize, usize, usize, usize, usize) -> CallbackTrampolineFnReturn;
+    unsafe extern "C" fn(usize, usize, usize, usize, usize, usize) -> CallbackTrampolineFnReturn;
 
 #[derive(Debug, Clone)]
 pub struct MockRtCallbackContext {
