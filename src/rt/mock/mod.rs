@@ -178,6 +178,7 @@ pub struct MockRt<ID: EFID, A: MockRtAllocator> {
 impl<ID: EFID, A: MockRtAllocator> MockRt<ID, A> {
     pub unsafe fn new(
         zero_copy_immutable: bool,
+        all_upgrades_valid: bool,
         allocator: A,
         _branding: ID,
     ) -> (
@@ -191,7 +192,7 @@ impl<ID: EFID, A: MockRtAllocator> MockRt<ID, A> {
                 allocator,
                 _id: PhantomData,
             },
-            unsafe { AllocScope::new(MockRtAllocChain::Base) },
+            unsafe { AllocScope::new(MockRtAllocChain::Base(all_upgrades_valid)) },
             unsafe { AccessScope::new() },
         )
     }
@@ -337,7 +338,10 @@ impl MockRtCallbackDescriptor<'_> {
 
 #[derive(Debug)]
 pub enum MockRtAllocChain<'a> {
-    Base,
+    // Because the MockRt does not have insights into or control over
+    // where the foreign library allocates, we allow disabling upgrade
+    // checks. Otherwise, only stacked allocations can be upgraded.
+    Base(bool),
     Allocation(MockRtAllocation, &'a MockRtAllocChain<'a>),
     Callback(
         usize,
@@ -355,7 +359,7 @@ impl<'a> Iterator for MockRtAllocChainIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(cur) = self.0 {
             self.0 = match cur {
-                MockRtAllocChain::Base => None,
+                MockRtAllocChain::Base(_) => None,
                 MockRtAllocChain::Allocation(_, pred) => Some(pred),
                 MockRtAllocChain::Callback(_, _, pred) => Some(pred),
                 MockRtAllocChain::Cons(pred) => Some(pred),
@@ -375,7 +379,7 @@ impl<'a> MockRtAllocChain<'a> {
 
     fn is_valid_int(&self, ptr: *mut (), len: usize, mutable: bool) -> bool {
         self.iter().any(|elem| match elem {
-            MockRtAllocChain::Base => false,
+            MockRtAllocChain::Base(all_upgrades_valid) => *all_upgrades_valid,
             MockRtAllocChain::Allocation(alloc, _) => alloc.matches(ptr, len, mutable),
             MockRtAllocChain::Callback(_, _, _) => false,
             MockRtAllocChain::Cons(_) => false,
@@ -385,7 +389,7 @@ impl<'a> MockRtAllocChain<'a> {
     fn next_callback_id(&self) -> usize {
         self.iter()
             .find_map(|elem| match elem {
-                MockRtAllocChain::Base => None,
+                MockRtAllocChain::Base(_) => None,
                 MockRtAllocChain::Allocation(_, _) => None,
                 MockRtAllocChain::Callback(id, _, _) => Some(id + 1),
                 MockRtAllocChain::Cons(_) => None,
@@ -395,7 +399,7 @@ impl<'a> MockRtAllocChain<'a> {
 
     fn find_callback_descriptor(&self, id: usize) -> Option<&MockRtCallbackDescriptor<'_>> {
         self.iter().find_map(|elem| match elem {
-            MockRtAllocChain::Base => None,
+            MockRtAllocChain::Base(_) => None,
             MockRtAllocChain::Allocation(_, _) => None,
             MockRtAllocChain::Callback(desc_id, desc, _) => {
                 if id == *desc_id {
