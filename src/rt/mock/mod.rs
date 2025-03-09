@@ -54,7 +54,8 @@ impl CallbackReturn for MockRtCallbackReturn {
 
 // TODO: this should be a hashmap which takes a runtime ID derived from the EFID
 // as key, to work with multiple mock runtimes in parallel:
-static mut ACTIVE_ALLOC_CHAIN_HEAD_REF: Option<*const MockRtAllocChain<'static>> = None;
+static mut ACTIVE_ALLOC_CHAIN_HEAD_REF: Option<(*const MockRtAllocChain<'static>, *const ())> =
+    None;
 
 #[inline(never)]
 extern "C" fn mock_rt_callback_dispatch<ID: EFID>(
@@ -62,28 +63,29 @@ extern "C" fn mock_rt_callback_dispatch<ID: EFID>(
     callback_ctx: &MockRtCallbackContext,
     callback_ret: &mut MockRtCallbackReturn,
 ) {
-    let alloc_chain_head_ref_opt: &Option<*const MockRtAllocChain<'_>> =
+    let alloc_chain_head_ref_opt: &Option<(*const MockRtAllocChain<'_>, *const ())> =
         unsafe { &*core::ptr::addr_of!(ACTIVE_ALLOC_CHAIN_HEAD_REF) };
 
-    let alloc_chain_head_ref_ptr = alloc_chain_head_ref_opt.unwrap();
-
+    let (alloc_chain_head_ref_ptr, id_imprint_ptr) = alloc_chain_head_ref_opt.unwrap();
     let alloc_chain_head_ref: &MockRtAllocChain<'static> = unsafe { &*alloc_chain_head_ref_ptr };
+    let id_imprint: &ID::Imprint = unsafe { &*(id_imprint_ptr as *const ID::Imprint) };
 
     let callback_desc = alloc_chain_head_ref
         .find_callback_descriptor(callback_id)
         .expect("Callback not found!");
 
     let mut inner_alloc_scope: AllocScope<'_, MockRtAllocChain<'_>, ID> =
-        unsafe { AllocScope::new(MockRtAllocChain::Cons(alloc_chain_head_ref)) };
+        unsafe { AllocScope::new(MockRtAllocChain::Cons(alloc_chain_head_ref), *id_imprint) };
 
     unsafe {
         callback_desc.invoke(
             callback_ctx,
             callback_ret,
             &mut inner_alloc_scope as *mut _ as *mut (),
-            // Safe, as this should only be triggered by foreign code, when the only
-            // existing AccessScope<ID> is already borrowed by the trampoline:
-            &mut AccessScope::<ID>::new() as *mut _ as *mut (),
+            // Safe, as this should only be triggered by foreign code, when the
+            // only existing AccessScope<ID> is already borrowed by the
+            // trampoline.
+            &mut AccessScope::<ID>::new(*id_imprint) as *mut _ as *mut (),
         )
     };
 }
@@ -172,7 +174,7 @@ pub trait MockRtAllocator {
 pub struct MockRt<ID: EFID, A: MockRtAllocator> {
     zero_copy_immutable: bool,
     allocator: A,
-    _id: PhantomData<ID>,
+    id_imprint: ID::Imprint,
 }
 
 impl<ID: EFID, A: MockRtAllocator> MockRt<ID, A> {
@@ -180,7 +182,7 @@ impl<ID: EFID, A: MockRtAllocator> MockRt<ID, A> {
         zero_copy_immutable: bool,
         all_upgrades_valid: bool,
         allocator: A,
-        _branding: ID,
+        branding: ID,
     ) -> (
         Self,
         AllocScope<'static, MockRtAllocChain<'static>, ID>,
@@ -190,10 +192,15 @@ impl<ID: EFID, A: MockRtAllocator> MockRt<ID, A> {
             MockRt {
                 zero_copy_immutable,
                 allocator,
-                _id: PhantomData,
+                id_imprint: branding.get_imprint(),
             },
-            unsafe { AllocScope::new(MockRtAllocChain::Base(all_upgrades_valid)) },
-            unsafe { AccessScope::new() },
+            unsafe {
+                AllocScope::new(
+                    MockRtAllocChain::Base(all_upgrades_valid),
+                    branding.get_imprint(),
+                )
+            },
+            unsafe { AccessScope::new(branding.get_imprint()) },
         )
     }
 
@@ -219,6 +226,10 @@ impl<ID: EFID, A: MockRtAllocator> MockRt<ID, A> {
             &'b mut AllocScope<'_, <Self as EncapfnRt>::AllocTracker<'_>, <Self as EncapfnRt>::ID>,
         ) -> R,
     {
+        if self.id_imprint != alloc_scope.id_imprint() {
+            return Err(EFError::IDMismatch);
+        }
+
         struct Context<'a, ClosureTy> {
             closure: &'a mut ClosureTy,
         }
@@ -255,24 +266,38 @@ impl<ID: EFID, A: MockRtAllocator> MockRt<ID, A> {
 
         let callback_id = alloc_scope.tracker().next_callback_id();
 
-        let alloc_chain_head_ref_opt: &mut Option<*const MockRtAllocChain<'_>> =
-            unsafe { &mut *core::ptr::addr_of_mut!(ACTIVE_ALLOC_CHAIN_HEAD_REF) };
-        let outer_alloc_chain_head_ref = alloc_chain_head_ref_opt.clone();
-
         let mut inner_alloc_scope = unsafe {
-            AllocScope::new(MockRtAllocChain::Callback(
-                callback_id,
-                MockRtCallbackDescriptor {
-                    wrapper: callback_wrapper::<C>,
-                    context: &mut ctx as *mut _ as *mut c_void,
-                    _lt: PhantomData::<&'a mut c_void>,
-                },
-                alloc_scope.tracker(),
-            ))
+            AllocScope::new(
+                MockRtAllocChain::Callback(
+                    callback_id,
+                    MockRtCallbackDescriptor {
+                        wrapper: callback_wrapper::<C>,
+                        context: &mut ctx as *mut _ as *mut c_void,
+                        _lt: PhantomData::<&'a mut c_void>,
+                    },
+                    alloc_scope.tracker(),
+                ),
+                alloc_scope.id_imprint(),
+            )
         };
 
+        let alloc_chain_head_ref_opt: &mut Option<(*const MockRtAllocChain<'_>, *const ())> =
+            unsafe { &mut *core::ptr::addr_of_mut!(ACTIVE_ALLOC_CHAIN_HEAD_REF) };
+
+        // Implement a "stack" of ACTIVE_ALLOC_CHAIN_HEAD_REFs, keeping the
+        // previous value in a local variable. We'll put it back after running
+        // our closure:
+        let outer_alloc_chain_head_ref = alloc_chain_head_ref_opt.clone();
+
+        // "Push" a new stack top, consisting of the new reference to the
+        // inner_alloc_scope's tracker and an ID imprint value:
         let tracker = inner_alloc_scope.tracker() as *const _;
-        *alloc_chain_head_ref_opt = Some(tracker as *const MockRtAllocChain<'static>);
+        let id_imprint: ID::Imprint = alloc_scope.id_imprint();
+        *alloc_chain_head_ref_opt = Some((
+            tracker as *const MockRtAllocChain<'static>,
+            &id_imprint as *const ID::Imprint as *const (),
+        ));
+
         let callback_trampoline = MockRtCallbackTrampolinePool::<ID>::CALLBACKS[callback_id];
 
         let res = fun(
@@ -280,9 +305,12 @@ impl<ID: EFID, A: MockRtAllocator> MockRt<ID, A> {
             &mut inner_alloc_scope,
         );
 
-        // Reset the alloc_chain_head_ref_opt:
-        *alloc_chain_head_ref_opt = outer_alloc_chain_head_ref;
+        // Reset the alloc_chain_head_ref_opt to the previous value.
+        let _inner_alloc_chain_head_ref =
+            unsafe { core::ptr::replace(alloc_chain_head_ref_opt, outer_alloc_chain_head_ref) };
 
+        // All the references of `_inner_alloc_chain_head_ref` are local to our
+        // stack, so there's nothing we'd need to deallocate:
         Ok(res)
     }
 }
@@ -468,6 +496,10 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
             &'b mut AllocScope<'_, Self::AllocTracker<'_>, Self::ID>,
         ) -> R,
     {
+        if self.id_imprint != alloc_scope.id_imprint() {
+            return Err(EFError::IDMismatch);
+        }
+
         let typecast_callback =
             &mut |callback_ctx: &MockRtCallbackContext,
                   callback_ret: &mut MockRtCallbackReturn,
@@ -487,6 +519,26 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
         // as that creates life-time issues when the `MockRtAllocChain` is
         // parameterized over it:
         self.setup_callback_int(typecast_callback, alloc_scope, fun)
+    }
+
+    fn execute<R, F: FnOnce() -> R>(
+        &self,
+        alloc_scope: &mut AllocScope<'_, Self::AllocTracker<'_>, Self::ID>,
+        access_scope: &mut AccessScope<Self::ID>,
+        f: F,
+    ) -> R {
+        if self.id_imprint != alloc_scope.id_imprint()
+            || self.id_imprint != access_scope.id_imprint()
+        {
+            panic!(
+                "ID mismatch! Rt: {:?}, AllocScope: {:?}, AccessScope: {:?}",
+                self.id_imprint,
+                alloc_scope.id_imprint(),
+                access_scope.id_imprint(),
+            );
+        }
+
+        f()
     }
 
     fn allocate_stacked_untracked_mut<F, R>(
@@ -512,19 +564,26 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
     where
         F: for<'b> FnOnce(*mut (), &'b mut AllocScope<'_, Self::AllocTracker<'_>, Self::ID>) -> R,
     {
+        if self.id_imprint != alloc_scope.id_imprint() {
+            return Err(EFError::IDMismatch);
+        }
+
         self.allocate_stacked_untracked_mut(layout, move |ptr| {
             // Create a new AllocScope instance that wraps a new allocation
             // tracker `Cons` list element that points to this allocation, and
             // its predecessors:
             let mut inner_alloc_scope = unsafe {
-                AllocScope::new(MockRtAllocChain::Allocation(
-                    MockRtAllocation {
-                        ptr,
-                        len: layout.size(),
-                        mutable: true,
-                    },
-                    alloc_scope.tracker(),
-                ))
+                AllocScope::new(
+                    MockRtAllocChain::Allocation(
+                        MockRtAllocation {
+                            ptr,
+                            len: layout.size(),
+                            mutable: true,
+                        },
+                        alloc_scope.tracker(),
+                    ),
+                    alloc_scope.id_imprint(),
+                )
             };
 
             // Hand a temporary mutable reference to this new scope to the
@@ -549,20 +608,27 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
             &'b mut AllocScope<'b, Self::AllocTracker<'b>, Self::ID>,
         ) -> R,
     {
+        if self.id_imprint != alloc_scope.id_imprint() {
+            return Err(EFError::IDMismatch);
+        }
+
         let t = UnsafeCell::new(MaybeUninit::<T>::uninit());
 
         // Create a new AllocScope instance that wraps a new allocation
         // tracker `Cons` list element that points to this allocation, and
         // its predecessors:
         let mut inner_alloc_scope = unsafe {
-            AllocScope::new(MockRtAllocChain::Allocation(
-                MockRtAllocation {
-                    ptr: &t as *const _ as *const _ as *mut _,
-                    len: core::mem::size_of::<T>(),
-                    mutable: true,
-                },
-                alloc_scope.tracker(),
-            ))
+            AllocScope::new(
+                MockRtAllocChain::Allocation(
+                    MockRtAllocation {
+                        ptr: &t as *const _ as *const _ as *mut _,
+                        len: core::mem::size_of::<T>(),
+                        mutable: true,
+                    },
+                    alloc_scope.tracker(),
+                ),
+                alloc_scope.id_imprint(),
+            )
         };
 
         // Hand a temporary mutable reference to this new scope to the
@@ -575,7 +641,7 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
         Ok(fun(
             unsafe {
                 EFPtr::<T>::from(&t as *const _ as *mut UnsafeCell<MaybeUninit<T>> as *mut T)
-                    .upgrade_unchecked_mut()
+                    .upgrade_unchecked_mut(alloc_scope.id_imprint())
             },
             &mut inner_alloc_scope,
         ))
@@ -595,6 +661,12 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
             &'b mut AccessScope<Self::ID>,
         ) -> R,
     {
+        if self.id_imprint != alloc_scope.id_imprint()
+            || self.id_imprint != access_scope.id_imprint()
+        {
+            return Err(EFError::IDMismatch);
+        }
+
         if self.zero_copy_immutable {
             // We can't wrap `write_stacked_ref_t` here, as our `T: ?Copy`.
 
@@ -612,14 +684,17 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
             // tracker `Cons` list element that points to this allocation, and
             // its predecessors:
             let mut inner_alloc_scope = unsafe {
-                AllocScope::new(MockRtAllocChain::Allocation(
-                    MockRtAllocation {
-                        ptr: &stored as *const _ as *const _ as *mut _,
-                        len: core::mem::size_of::<T>(),
-                        mutable: false,
-                    },
-                    alloc_scope.tracker(),
-                ))
+                AllocScope::new(
+                    MockRtAllocChain::Allocation(
+                        MockRtAllocation {
+                            ptr: &stored as *const _ as *const _ as *mut _,
+                            len: core::mem::size_of::<T>(),
+                            mutable: false,
+                        },
+                        alloc_scope.tracker(),
+                    ),
+                    alloc_scope.id_imprint(),
+                )
             };
 
             // Hand a temporary immutable reference to this new scope to the
@@ -634,7 +709,7 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
                     EFPtr::<T>::from(
                         &stored as *const _ as *mut UnsafeCell<MaybeUninit<T>> as *mut T,
                     )
-                    .upgrade_unchecked()
+                    .upgrade_unchecked(alloc_scope.id_imprint())
                 },
                 &mut inner_alloc_scope,
                 access_scope,
@@ -666,6 +741,12 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
             &'b mut AccessScope<Self::ID>,
         ) -> R,
     {
+        if self.id_imprint != alloc_scope.id_imprint()
+            || self.id_imprint != access_scope.id_imprint()
+        {
+            return Err(EFError::IDMismatch);
+        }
+
         if self.zero_copy_immutable {
             // For safety considerations, see `write_stacked_t`.
 
@@ -673,14 +754,17 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
             // tracker `Cons` list element that points to this allocation, and
             // its predecessors:
             let mut inner_alloc_scope = unsafe {
-                AllocScope::new(MockRtAllocChain::Allocation(
-                    MockRtAllocation {
-                        ptr: t as *const _ as *const _ as *mut _,
-                        len: core::mem::size_of::<T>(),
-                        mutable: false,
-                    },
-                    alloc_scope.tracker(),
-                ))
+                AllocScope::new(
+                    MockRtAllocChain::Allocation(
+                        MockRtAllocation {
+                            ptr: t as *const _ as *const _ as *mut _,
+                            len: core::mem::size_of::<T>(),
+                            mutable: false,
+                        },
+                        alloc_scope.tracker(),
+                    ),
+                    alloc_scope.id_imprint(),
+                )
             };
 
             // Hand a temporary immutable reference to this new scope to the
@@ -693,7 +777,7 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
             Ok(fun(
                 unsafe {
                     EFPtr::<T>::from(t as *const _ as *mut UnsafeCell<MaybeUninit<T>> as *mut T)
-                        .upgrade_unchecked()
+                        .upgrade_unchecked(alloc_scope.id_imprint())
                 },
                 &mut inner_alloc_scope,
                 access_scope,
@@ -725,6 +809,12 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
             &'b mut AccessScope<Self::ID>,
         ) -> R,
     {
+        if self.id_imprint != alloc_scope.id_imprint()
+            || self.id_imprint != access_scope.id_imprint()
+        {
+            return Err(EFError::IDMismatch);
+        }
+
         if self.zero_copy_immutable {
             // For safety considerations, see `write_stacked_t`.
 
@@ -732,14 +822,17 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
             // tracker `Cons` list element that points to this allocation, and
             // its predecessors:
             let mut inner_alloc_scope = unsafe {
-                AllocScope::new(MockRtAllocChain::Allocation(
-                    MockRtAllocation {
-                        ptr: src as *const _ as *const _ as *mut _,
-                        len: core::mem::size_of::<T>() * src.len(),
-                        mutable: false,
-                    },
-                    alloc_scope.tracker(),
-                ))
+                AllocScope::new(
+                    MockRtAllocChain::Allocation(
+                        MockRtAllocation {
+                            ptr: src as *const _ as *const _ as *mut _,
+                            len: core::mem::size_of::<T>() * src.len(),
+                            mutable: false,
+                        },
+                        alloc_scope.tracker(),
+                    ),
+                    alloc_scope.id_imprint(),
+                )
             };
 
             // Hand a temporary immutable reference to this new scope to the
@@ -752,7 +845,7 @@ unsafe impl<ID: EFID, A: MockRtAllocator> EncapfnRt for MockRt<ID, A> {
             Ok(fun(
                 unsafe {
                     EFPtr::<T>::from(src as *const _ as *mut UnsafeCell<MaybeUninit<T>> as *mut T)
-                        .upgrade_unchecked_slice(src.len())
+                        .upgrade_unchecked_slice(src.len(), alloc_scope.id_imprint())
                 },
                 &mut inner_alloc_scope,
                 access_scope,

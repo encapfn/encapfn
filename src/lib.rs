@@ -16,6 +16,7 @@ pub enum EFError {
     InternalError,
     AllocNoMem,
     AllocInvalidLayout,
+    IDMismatch,
 }
 
 pub type EFResult<T> = Result<types::EFCopy<T>, EFError>;

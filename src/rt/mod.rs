@@ -59,23 +59,14 @@ pub unsafe trait EncapfnRt {
             &'b mut AllocScope<'_, Self::AllocTracker<'_>, Self::ID>,
         ) -> R;
 
-    // Can be used to set up memory protection before running the invoke asm.
+    // Can be used to set up memory protection before running the
+    // invoke asm. May be implemented as a nop.
     fn execute<R, F: FnOnce() -> R>(
         &self,
-        _alloc_scope: &mut AllocScope<'_, Self::AllocTracker<'_>, Self::ID>,
-        _access_scope: &mut AccessScope<Self::ID>,
+        alloc_scope: &mut AllocScope<'_, Self::AllocTracker<'_>, Self::ID>,
+        access_scope: &mut AccessScope<Self::ID>,
         f: F,
-    ) -> R {
-        // Default: nop.
-        //
-        // If implementations want to support callbacks, this will need to stash
-        // the AllocScope + AccessScope somewhere.
-        //
-        // For the AccessScope, they may alternatively rely on it being
-        // exclusively borrowed for the duration of the call and create a new
-        // instance with a strictly shorter lifetime.
-        f()
-    }
+    ) -> R;
 
     fn allocate_stacked_untracked_mut<F, R>(
         &self,
@@ -107,12 +98,15 @@ pub unsafe trait EncapfnRt {
             &'b mut AllocScope<'_, Self::AllocTracker<'_>, Self::ID>,
         ) -> R,
     {
+        let id_imprint = alloc_scope.id_imprint();
         self.allocate_stacked_mut(
             core::alloc::Layout::new::<T>(),
             alloc_scope,
             |allocated_ptr, new_alloc_scope| {
                 fun(
-                    unsafe { EFPtr::<T>::from(allocated_ptr as *mut T).upgrade_unchecked_mut() },
+                    unsafe {
+                        EFPtr::<T>::from(allocated_ptr as *mut T).upgrade_unchecked_mut(id_imprint)
+                    },
                     new_alloc_scope,
                 )
             },
@@ -220,13 +214,15 @@ pub unsafe trait EncapfnRt {
             &'b mut AllocScope<'_, Self::AllocTracker<'_>, Self::ID>,
         ) -> R,
     {
+        let id_imprint = alloc_scope.id_imprint();
         self.allocate_stacked_mut(
             core::alloc::Layout::array::<T>(len).unwrap(),
             alloc_scope,
             |allocated_ptr, new_alloc_scope| {
                 fun(
                     unsafe {
-                        EFPtr::<T>::from(allocated_ptr as *mut T).upgrade_unchecked_slice_mut(len)
+                        EFPtr::<T>::from(allocated_ptr as *mut T)
+                            .upgrade_unchecked_slice_mut(len, id_imprint)
                     },
                     new_alloc_scope,
                 )
